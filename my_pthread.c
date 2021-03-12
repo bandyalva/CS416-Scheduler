@@ -1,779 +1,696 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <string.h>
-#include <ctype.h>
-#include <signal.h>
-#include <ucontext.h>
-#include <errno.h>
-//#include <pthread.h>
-#include "my_pthread_t.h"
+// File:	rpthread.c
 
-int maxThreads = 500;
+// List all group member's name:
+// username of iLab:
+// iLab Server:
 
-//bunch of flags
-int isFirstThread = 0;
-int addedParent = 0;
-int threadCount = 1;
-int exitCalled = 0;
-int joinCalled = 0;
-int freeNode = 0;
-int setWaiting = 0;
+#include "rpthread.h"
 
-//for setting timers
-struct itimerval it_val;
-long int scheduleCount = 0;
-
-//currently executing node/thread
-threadNode *currentNode = NULL; 
-
-//various queues for scheduler
-ready_queue *readyQueue;
-join_queue *joinQueue;
-exit_queue *exitQueue;
-
-
-int my_pthread_create( my_pthread_t * thread, my_pthread_attr_t * attr, void *(*function)(void*), void * arg){
-    	
-    	if (threadCount == 500){
-		return EAGAIN;
-	}
-
-    //check if first time this function has been called
-    if (isFirstThread == 0){
-        //printf("first thread routine\n");
-        isFirstThread = 1;
-
-        //save context of current thread (calling function)
-        ucontext_t *parent, *child = NULL;
-        parent = (ucontext_t*)malloc(sizeof(ucontext_t));
-        child = (ucontext_t*)malloc(sizeof(ucontext_t));
-
-        if (getcontext(parent) == -1){
-            perror("getcontext: could not get parent context\n");
-            exit(1);
-        }
-        //if added parent to queue
-        if (addedParent == 0){
-
-            //printf("adding parent context and creating child context\n");
-            //get context that will used to create new context
-            if (getcontext(child) == -1){
-                perror("getContext: could not get child context");
-                exit(1);
-            }
-
-            //modify context for a new stack
-            //printf("modifying child stack\n");
-            child->uc_link = 0;
-            child->uc_stack.ss_sp = malloc(STACK_SIZE);
-            child->uc_stack.ss_size = STACK_SIZE;
-            child->uc_stack.ss_flags = 0;
-
-            if(child->uc_stack.ss_sp == 0){
-                perror("malloc: could not allocate stack");
-            }
-
-            //printf("making child context\n");
-
-            //link new context with a function
-            makecontext(child, (void*)function, 1, arg);
-            
-            //create my_pthread__t object for child thread
-            my_pthread_t * childThread = (my_pthread_t*)malloc(sizeof(my_pthread_t));
-            childThread->tid = threadCount;
-            childThread->context = child;
-            thread->tid = childThread->tid;
-            //printf("create: tid = %d\n", thread->tid);
-            //thread = (pthread_t*)malloc(sizeof(pthread_t));
-            //childThread->pthread = thread;
-            childThread->exited = 0;
-            threadNode * childNode = (threadNode *)malloc(sizeof(threadNode));
-            childNode->mythread = childThread;
-            childNode->next = NULL;
-
-            //create my_pthread_t object for parent thread
-            my_pthread_t * parentThread = (my_pthread_t*)malloc(sizeof(my_pthread_t));
-            parentThread->tid = 0;
-            parentThread->context = parent;
-            threadNode * parentNode = (threadNode *)malloc(sizeof(threadNode));
-            parentNode->mythread = parentThread;
-            parentNode->next = NULL;
-
-            
-            initializeScheduler();
-
-            //printf("adding parent and child to ready queue\n");
-            currentNode = parentNode;
-            //printf("creating thread: %d\n", parentNode->mythread->tid);
-            enqueueReady(0, parentNode);
-            //printf("creating thread: %d\n", childNode->mythread->tid);
-            enqueueReady(0, childNode);
-            addedParent = 1;
-
-            //run scheduler for the first time
-            scheduler();
-        }
-        return 0;
-    }
-    else {
-
-        //sets up a new thread and adds it to ready queue
-        ucontext_t *child = (ucontext_t*)malloc(sizeof(ucontext_t));
-
-        if (getcontext(child) == -1){
-                perror("getContext: could not get context");
-                return -1;
-            }
-
-            //modify context for a new stack
-            child->uc_link = 0;
-            child->uc_stack.ss_sp = malloc(STACK_SIZE);
-            child->uc_stack.ss_size = STACK_SIZE;
-            child->uc_stack.ss_flags = 0;
-
-            if(child->uc_stack.ss_sp == 0){
-                perror("malloc: could not allocate stack");
-                return -1;
-            }
-
-            threadCount++;
-
-            //create the context for child
-            makecontext(child, (void*)function, 1, arg);
-
-            //create my_pthread_t for child thread
-            my_pthread_t * childThread = (my_pthread_t*)malloc(sizeof(my_pthread_t));
-            childThread->tid = threadCount;
-            childThread->context = child;
-            thread->tid = childThread->tid;
-            //printf("create: tid = %d\n", thread->tid);
-            //thread = (pthread_t*)malloc(sizeof(pthread_t));
-            //childThread->pthread = thread;
-            childThread->exited = 0;
-            threadNode * childNode = (threadNode *)malloc(sizeof(threadNode));
-            childNode->mythread = childThread;
-            childNode->next = NULL;
-            //printf("creating thread: %d\n", childNode->mythread->tid);
-            enqueueReady(0, childNode);
-            return 0;
-    }
-}
-
-void my_pthread_yield(){
-    //reset timer
-    it_val.it_value.tv_sec = 0;
-    it_val.it_value.tv_usec = 0;
-    it_val.it_interval = it_val.it_value;
-
-    if(setitimer(ITIMER_REAL, &it_val, NULL) == -1){
-        perror("error calling setitimer()");
-        exit(1);
-    }
-    scheduler();
-}
-
-/* 
-calling thread checks to see if there are any threads waiting on it. If so
-the waiting threads are rescheduled. If there are not any waiting threads,
-we ass the calling thread to a list of exited threads.
-*/
-void my_pthread_exit(void *value_ptr){
-    //printf("my_pthread_exit called \n");
-
-    if (currentNode->mythread->tid == 0){
-        //printf("parent called exit\n");
-        exit(1);
-    }
-
-    //reset timer
-    it_val.it_value.tv_sec = 0;
-    it_val.it_value.tv_usec = 0;
-    it_val.it_interval = it_val.it_value;
-
-    if(setitimer(ITIMER_REAL, &it_val, NULL) == -1){
-        perror("error calling setitimer()");
-        exit(1);
-    }
-
-    //search joinQueue to see if thread that called join on currentThread exists there
-    if (searchJoin(currentNode->mythread->tid) == -1){
-        dequeueReady(currentNode->level);
-        enqueueExit(currentNode);
-    }
-    else {
-        dequeueReady(currentNode->level);
-        freeNode = 1;
-    }
-
-    currentNode->mythread->value_ptr = value_ptr;
-    exitCalled = 1;
-    scheduler();
-}
-
+//PSEUDOCODE:
 /*
-calling thread checks to see if there the specified thread has been exited. does
-this by searching through exited list. If not, we add the calling thread to the
-join list (queue?)
+1.start program
+2. main run
+3. main call rpthread_create
+4. in phtread_create, init scheduler+ timer+ sighandlers+ etc
+5. create contect for new thread+ current funning funct (main)
+6. getcontect for both, makecontext for new thread (allocate stack)
+7. create scheduler (optional), place in some queues and return with pthread_create
+8. main still running
+9. timer interrupt
+10. save context into main context
+11.swap scheduler (with swapcontext)
 */
 
-int my_pthread_join(my_pthread_t thread, void **value_ptr){
+// INITAILIZE ALL YOUR VARIABLES HERE
+// YOUR CODE HERE
+
+tQueue *readyQueue;
+
+tQueue *exitQueue;
+
+tQueue *joinQueue;
+
+tQueue *waitQueue;//this one is for mutex
+
+
+tNode *currentNode = NULL;
+
+int firstThread = 1;
+int status = -1; //0:ready, 1:scheduled,2:blocked
+
+//var to use in schedule
+int freeCalled = 0; // if 1, run free
+int mutexCalled = 0; //if 1, run mutex func
+int exitCalled = 0; //if 1, run exit func
+int joinCalled = 0; //if 1, run join func
+
+//int parentAdded = 0; //if 1, there is parent
+
+struct itimerval tv; //timer
+
+/* create a new thread */
+int rpthread_create(rpthread_t * thread, pthread_attr_t * attr, 
+                      void *(*function)(void*), void * arg) {
+       // create Thread Control Block
+       // create and initialize the context of this thread
+       // allocate space of stack for this thread to run
+       // after everything is all set, push this thread int
+       // YOUR CODE HERE
 	
-	if (thread.tid > threadCount){
-		return ESRCH;
+    	//if queue is empty, ie. this is the first thread, then we need to add the caller to the queue. This means that there needs to be a context made for the caller 
+
+	/*
+	tNode* node = malloc(sizeof(tNode*));
+	//i added a '*,' error without *
+	node->curtcb.tid = *thread; 
+	
+	node->curtcb.ctx = malloc(sizeof(ucontext_t*));
+	getcontext(node->curtcb.ctx);
+	node->curtcb.ctx->uc_stack.ss_size = SIGSTKSZ;
+	node->curtcb.ctx->uc_stack.ss_sp = malloc(SIGSTKSZ); 
+	//memset(node->curtcb.ctx->uc_stack.ss_sp, '/0', SIGSTKSZ);
+	makecontext(node->curtcb.ctx, *function, arg);
+	*/
+
+
+	//WE WILL NEED TO MAKE THE SCHEDULER, and INIT_SCHEDULER
+
+	//if queue empty
+	if(firstThread == 1){
+
+		status = READY; //make status into ready
+
+		//tNode* parent= malloc(sizeof(tNode*));
+		//set up thread node parent
+		tNode* parent= malloc(sizeof(tNode*));
+		parent->curtcb.ctx = malloc(sizeof(ucontext_t*));
+		parent->nextNode = NULL;
+		parent->jTids = NULL;
+		parent->curtcb.tid = 0; 
+		//define curtcb for parent
+		//i added a '*,' error without *
+
+		getcontext(parent->curtcb.ctx);
+
+		init_schedule();
+
+		currentNode = parent;//we will need this for identifying which node to add to exit, join, and mutex
+		//i plan on using the currentNode to record the topNode in the Q, after parent is used
+
+		//add parent tnode to queque
+		enqueue(parent, readyQueue);
+		
+		//create child node
+		tNode* child= malloc(sizeof(tNode*));
+		child->curtcb.ctx = malloc(sizeof(ucontext_t*));
+
+		child->nextNode = NULL;
+		child->jTids = NULL;
+
+		child->curtcb.tid = thread; 
+		child->curtcb.ctx = malloc(sizeof(ucontext_t*));
+
+		getcontext(child->curtcb.ctx);
+		child->curtcb.ctx->uc_stack.ss_size = SIGSTKSZ;
+		child->curtcb.ctx->uc_stack.ss_sp = malloc(SIGSTKSZ); 
+		child->curtcb.ctx->uc_link = 0; 
+		makecontext(child->curtcb.ctx, (void*)function,1, arg);
+	
+		parent->curtcb.ctx->uc_link = child->curtcb.ctx; 
+		enqueue(child, readyQueue);
+		schedule();
+
+		//we need to make this function
+		//though the schdule is for partII, but for now we can treat it as the runner
+
+		return 0;
+	}
+	else{//queue exists
+
+		//create child node
+		tNode* child= malloc(sizeof(tNode*));
+		child->nextNode = NULL;
+		child->jTids = NULL;
+		child->curtcb.tid = thread; 
+		child->curtcb.ctx = malloc(sizeof(ucontext_t*));
+
+		getcontext(child->curtcb.ctx);
+		child->curtcb.ctx->uc_stack.ss_size = SIGSTKSZ;
+		child->curtcb.ctx->uc_stack.ss_sp = malloc(SIGSTKSZ); 
+		child->curtcb.ctx->uc_link = 0; 
+		makecontext(child->curtcb.ctx, (void*)function,1, arg);
+
+		//connect child node to target queue according to global var status
+		if(status==READY){
+			tQueue *targetQueue = readyQueue;
+			enqueue(child, targetQueue);
+
+		}
+
+		return 0;
+	}
+}
+
+/* give CPU possession to other user-level threads voluntarily */
+
+//i am unsure how to implement this function...
+/*
+	My idea is that since we are swapcontext the scheduler so the scheduler thread
+	can be enqueue the current threed back to runqueue
+*/
+int rpthread_yield() {
+	
+	// change thread state from Running to Ready
+	// save context of this thread to its thread control block
+	// wwitch from thread context to scheduler context
+	// YOUR CODE HERE
+
+	//using swapcontext()
+	//status = SCHEDULED; //change from ready->schedule
+
+	resetTime();
+
+	schedule();
+
+	return 0;
+};
+
+/* terminate a thread */
+void rpthread_exit(void *value_ptr) {
+	// Deallocated any dynamic memory created when starting this thread
+
+	// YOUR CODE HERE
+
+
+
+	/*
+		for this i am adding the parent node(currentNode) to exitQueue
+		if the node is not found in the joinQueue, i will dequeue the node
+		from readyQueue and add the node to exitqueue
+	*/
+
+
+	resetTime();
+
+	//searchQ is looking for the threads that called join on it
+	//thus search through joinQ
+	//the function would remove the node from joinQ and enqueue it to readyQ
+	if(searchQ(currentNode->curtcb.tid, joinQueue)==0){
+
+		dequeue(readyQueue);//remove head from readyqueue
+		freeCalled = 1;//thread exited from readyQ
 	}
 
-    //printf("my_pthread_join called\n");
+	else if(searchQ(currentNode->curtcb.tid, joinQueue) == -1){ //not found
 
-    //reset timer
-    it_val.it_value.tv_sec = 0;
-    it_val.it_value.tv_usec = 0;
-    it_val.it_interval = it_val.it_value;
+		dequeue(readyQueue);//dequeue from 
+		enqueue(currentNode, exitQueue); //add to exit queue
+	}
 
-    if(setitimer(ITIMER_REAL, &it_val, NULL) == -1){
-        perror("error calling setitimer()");
-        exit(1);
-    }
+	//WE NEED TO MAKE SCHEDULER TO RUN
 
-    //search exitQueue to see if specified thread has already been exited
+	//make parent node's value_ptr equal to value_ptr
+	//this works cause the currentNode is either added to exitQueue if not found
+	//or value_ptr is not found, we add the value to currentNdoe's value_ptr
+	currentNode->curtcb.value_ptr = value_ptr;
 
-    if (searchExit(thread.tid) == -1){
-        currentNode->mythread->joinOn = thread.tid;
-        dequeueReady(currentNode->level);
-        enqueueJoin(currentNode);
-        joinCalled = 1;
-        //printf("adding thread to joinQueue: %d", currentNode->mythread->tid);
-        //printf("thread parameter: %d saved parameter: %d\n", thread, currentNode->mythread->joinOn);
-        scheduler();
-    }
-
-    return 0;
+	exitCalled = 1; //to show exit funct called, so do not equeue readyQ
+	schedule();
 }
 
 
-int my_pthread_mutex_init(my_pthread_mutex_t *mutex, const my_pthread_mutexattr_t *mutexattr){
+/* Wait for thread termination */
+int rpthread_join(rpthread_t thread, void **value_ptr) {
 	
-	if (mutex->init == 1){
-		return EBUSY;
-	}	
+	// wait for a specific thread to terminate
+	// de-allocate any dynamic memory created by the joining thread
+  
+	// YOUR CODE HERE
+
+	resetTime();
+
+	/*
+	for this, i am search for the tid in the exitQueue,
+	if it is there (value_ptr is not null), the exiting thread's value will be
+	PASSED BACK (i enqueued it to the joinqueue).
+	*/
+
+	//we will search exitQueue to see if target thread (with tid) has been exited
+
+	if(searchQ(thread, exitQueue)== -1){
+	//thread id is not found in exitqueue, meaning we remove node from readyQ, and add to joinQ
+		currentNode = dequeue(readyQueue);//remove from readyqueue
+		enqueue(currentNode, joinQueue);//added to joinQueue
+
+		//makes new node and sets its tid to the one that we are waiting for 
+		tidNode* newNode = malloc(sizeof(tidNode*));
+		newNode->tid = thread;
+
+		//if list of joined tids is empty
+		if(currentNode->jTids == NULL){
+			currentNode->jTids = newNode; 
+
+		//insert onto the front
+		} else {
+			newNode->next = currentNode->jTids; 
+			currentNode->jTids = newNode->next; 
+		}
+		//WE NEED SCHEDULE
+		joinCalled = 1; 
+		schedule();
+
+		return 0;
+	}
+	//WE NEED SCHEDULE
+}
+
+/* initialize the mutex lock */
+int rpthread_mutex_init(rpthread_mutex_t *mutex, const pthread_mutexattr_t *mutexattr) {
+	//initialize data structures for this mutex
+
+	// YOUR CODE HERE
 
 	mutex->init = 1;
-    mutex->lock = UNLOCKED;
-    mutex->queueLock = UNLOCKED;
-    mutex->waitQueue = (wait_queue*)malloc(sizeof(wait_queue));
-    mutex->waitQueue->front = NULL;
-    mutex->waitQueue->end = NULL;
-    //printf("mutex created\n");
+	mutex->lock = 0;//unlock lock for tNode
+	mutex->lockQueue = 0;//unlock lock for tQueue
 
-    return 0;
+	mutex->wait = malloc(sizeof(tQueue*));
+	mutex->wait->head = NULL;
+	mutex->wait->tail = NULL;
+
+	return 0 ;
 }
 
-int my_pthread_mutex_lock(my_pthread_mutex_t *mutex){
+/* aquire the mutex lock */
+int rpthread_mutex_lock(rpthread_mutex_t *mutex) {
+        // use the built-in test-and-set atomic function to test the mutex
+        // if the mutex is acquired successfully, enter the critical section
+        // if acquiring mutex fails, push current thread into block list and //  
+        // context ` to the scheduler thread
 
-	if (mutex->init != 1){
-		return EINVAL;
-	}
+        // YOUR CODE HERE
 
-    while(__sync_lock_test_and_set(&mutex->lock, 1) == LOCKED){
-        spin_lock(mutex->queueLock);
-        if (mutex->lock == LOCKED){
-            dequeueReady(currentNode->level);
-            enqueueMutex(mutex->waitQueue, currentNode);
-            spin_unlock(mutex->queueLock);
-            setWaiting = 1;
-            scheduler();
-            //will be descheduled in the scheduler using setWaiting flag
-        }
-        else {
-            spin_unlock(mutex->queueLock);
-        }
-    }
-    //printf("lock acquired\n");
-    //if we need to this is where we return errors and also where we handle if
-    //the thread that locked the lock is exited
-    return 0;
-}
-
-//unlock
-int my_pthread_mutex_unlock(my_pthread_mutex_t *mutex){
-
-	if (mutex->init != 1){
-		return EINVAL;
-	}
-
-    
-    spin_lock(mutex->queueLock);
-    threadNode * node = dequeueMutex(mutex->waitQueue);
-    mutex->lock = UNLOCKED;
-    spin_unlock(mutex->queueLock);
-    if (node != NULL){
-        int level = node->level;
-        if (level == NUM_LEVELS - 1){
-            enqueueReady(level, node); 
-        }
-        else{
-            enqueueReady(level + 1, node); 
-        }
-    }
-    //printf("lock released\n");
-    //my_pthread_yield();
-
-    return 0;
-}
-
-int my_pthread_mutex_destroy(my_pthread_mutex_t *mutex){
-
-	if (mutex->lock == LOCKED){
-		return EBUSY;
-	}
-	if (mutex->init != 1){
-		return EINVAL;
-	}
-
-    threadNode *node = mutex->waitQueue->front;
-
-    while (node != NULL){
-        int level = node->level;
-        if (level == NUM_LEVELS - 1){
-            enqueueReady(level, node);
-        }
-        else {
-            enqueueReady(level + 1, node);
-        }
-        node = node->next;
-    }
-
-    free(mutex->waitQueue);
-    mutex->waitQueue = NULL;
-
-	mutex->init = 0;
-    mutex->lock = UNLOCKED;
-    mutex->queueLock = UNLOCKED;
-    mutex->waitQueue = NULL;
-    //printf("mutex destroyed\n");
-}
-
-
-
-
-//////////////////////////////////////////
-/*
-    Helper Functions
-*/
-//////////////////////////////////////////
-
-
-/*
-saves context of current thread and determines which thread will be run
-next and for how long. Also recalcuates the current thread's priority
-and moves it to the correct level of ready queue. 
-
-After a certain number of schedules, increases aging threads' priority.
-
-Sets timer for the next thread and swaps from current context to the next
-threads saved context.
-*/
-void scheduler(){
-
-    
-    //printf("currentThread: %d\n", currentNode->mythread->tid);
-
-    //printf("BEFORE UPDATE\n");
-    //printReady();
-    updateQueues();
-    //printf("AFTER UPDATE\n");
-    //printReady();
-    
-    threadNode *topNode = NULL;
-    
-    int i;
-
-    //find highest node in queue
-    for (i = 0; i < NUM_LEVELS; i++){
-        topNode = readyQueue->subqueues[i]->front;
-        if (topNode != NULL){
-            break;
-        }
-    }
-    if (topNode == NULL){
-        printf("scheduler: could not locate top thread or no more to schedule\n");
-        exit(1);
-    }
-    //search again if topNode is currently running thread
-    if (topNode->mythread->tid == currentNode->mythread->tid){
-        if (topNode->next != NULL){
-            topNode = topNode->next;
-        }
-        else {
-            for (i = i + 1; i < NUM_LEVELS; i++){
-                topNode = readyQueue->subqueues[i]->front;
-                if (topNode != NULL){
-                    //found topNode
-                    break;
-                }
-            }
-        }
-        if (topNode == NULL){
-            topNode = currentNode;
-        }
-    }
-    //printf("topNode: %d\n", topNode->mythread->tid);
-    //printf("topNode level: %d\n", topNode->level);
-    //recalculate current threads priority
-    int multiplier = readyQueue->subqueues[topNode->level]->multiplier;
-
-    it_val.it_value.tv_sec = 50 * multiplier / 1000;
-    it_val.it_value.tv_usec = (50 * multiplier * 1000) % 1000000;
-    it_val.it_interval = it_val.it_value;
-
-    if(setitimer(ITIMER_REAL, &it_val, NULL) == -1){
-        perror("error calling setitimer()");
-        exit(1);
-    }
-
-    threadNode *saveCurrent = currentNode;
-    currentNode = topNode;
-    scheduleCount++;
-    //equals 1 when a exiting thread has been freed 
-    if (freeNode == 1){
-        //printf("thread: %d being run with level: %d\n", topNode->mythread->tid, topNode->level);
-        //printf("no thread saved\n");
-        free(saveCurrent);
-        freeNode = 0;
-        setcontext(topNode->mythread->context);
-        
-    }
-    else{
-        //printf("swapping to thread %d from thread %d\n", topNode->mythread->tid, saveCurrent->mythread->tid);
-        swapcontext(saveCurrent->mythread->context, topNode->mythread->context);
-    }
-    
-
-}
-
-/*
-creates the ready queue and initializes each level
-also registers signal handler(s)
-*/
-void initializeScheduler(){
-
-    //printf("initializeScheduler\n");
-    //create ready queue
-    readyQueue = malloc(sizeof(ready_queue));
-    int i;
-    for (i = 0; i < NUM_LEVELS; i++){
-        readyQueue->subqueues[i] = (queue_level* )malloc(sizeof(queue_level));
-        readyQueue->subqueues[i]->front = NULL;
-        readyQueue->subqueues[i]->end = NULL;
-        readyQueue->subqueues[i]->level = i;
-    }
-    //set queue_level multipliers
-    readyQueue->subqueues[0]->multiplier = MULT_0;
-    readyQueue->subqueues[1]->multiplier = MULT_1;
-    readyQueue->subqueues[2]->multiplier = MULT_2;
-    readyQueue->subqueues[3]->multiplier = MULT_3;
-    readyQueue->subqueues[4]->multiplier = MULT_4;
-    readyQueue->subqueues[5]->multiplier = MULT_5;
-    readyQueue->subqueues[6]->multiplier = MULT_6;
-    readyQueue->subqueues[7]->multiplier = MULT_7;
-    readyQueue->subqueues[8]->multiplier = MULT_8;
-    readyQueue->subqueues[9]->multiplier = MULT_9;
-
-    joinQueue = (join_queue*)malloc(sizeof(join_queue));
-    joinQueue->front = NULL;
-    joinQueue->end = NULL;
-
-    exitQueue = (exit_queue*)malloc(sizeof(exit_queue));
-    exitQueue->front = NULL;
-    exitQueue->end = NULL;
-
-    //register signal handler
-    signal(SIGALRM, signal_handler);
-
-}
-
-//calls scheduler on SIGALRM
-void signal_handler (int signum){
-    scheduler();
-    
-}
-
-/*
-creates a threadNode to store a my_pthread_t object and adds to queue at
-specified level of ready queue
-*/
-void enqueueReady(int level, threadNode * node){
-    //printf("enqueueReady thread: %d level: %d\n", node->mythread->tid, level);
-    node->next = NULL;
-    queue_level * queue_level = readyQueue->subqueues[level];
-    node->level = level;
-
-    //if queue empty
-    if (queue_level->front == NULL){
-        queue_level->front = node;
-        queue_level->end = node;
-    }
-    else {
-        queue_level->end->next = node;
-        queue_level->end = node;
-    }
-}
-
-threadNode * dequeueReady(int level){
-    queue_level * queue_level = readyQueue->subqueues[level];
-
-    threadNode * node = queue_level->front;
-    threadNode * returnedNode = NULL;
-    if (queue_level->front == NULL){
-        returnedNode = NULL;
-    }
-    else if (node->next == NULL){
-        returnedNode = queue_level->front;
-        queue_level->front = NULL;
-        queue_level->end = NULL;
-    }
-    else {
-        returnedNode = queue_level->front;
-        queue_level->front = queue_level->front->next;
-        returnedNode->next = NULL;
-    }
-
-    return returnedNode;
-
-}
-
-
-//takes currentNode and demotes it to another level 
-void updateQueues(){
-    int level = currentNode->level;
-    if (joinCalled == 1){
-        joinCalled = 0;         //node has been removed from readyQueue
-    }
-    else if (exitCalled == 1){
-        exitCalled = 0;         //node has been removed from readyQueue
-    }
-    else if (setWaiting == 1){
-        setWaiting = 0;
-    }
-    else if (level < NUM_LEVELS - 1){
-        threadNode * node = dequeueReady(level);
-        enqueueReady(level + 1, node);
-    }
-    else{
-        threadNode * node = dequeueReady(level);
-        enqueueReady(level, node);
-    }
-    
-    if (scheduleCount % 10 == 0){
-    		queue_level * top = readyQueue->subqueues[0];
-    		queue_level * bottom = readyQueue->subqueues[NUM_LEVELS - 1];
-		
-		if (bottom->front != NULL){
-			if (top->front == NULL){
-				top->front = bottom->front;
-				top->end = bottom->end;
-				bottom->front = NULL;
-				bottom->end = NULL;
-			}
-			else {
-				top->end->next = bottom->front;
-				top->end = bottom->end;
-				bottom->front = NULL;
-				bottom->end = NULL;
-			}
-			
-			threadNode *node = top->front;;
-
-		    while (node != NULL){
-		    		node->level = 0;
-			   	node = node->next;
-		    }
-			
+		if(mutex->init!=1){//mutex not yet initialized
+			printf("ERROR: MUTEX not initialized");
+			return -999;
 		}
 		
-    }
+		while( __sync_lock_test_and_set(&mutex->lock, 1) == 1){//LOCKED
+
+			mutex->lockQueue = 1; //lock the Qlock
+
+			if(mutex->lock == 1) {//if mutex is locked
+
+				dequeue(readyQueue);//remove head from readyQ
+				enqueue(currentNode, mutex->wait);//enqueue the currentNode to mutex's wait
+
+				mutex->lockQueue= 0; //unlock mutex's Qlock
+
+				mutexCalled = 1;
+
+				schedule();//run scheduler
+
+			}
+			else{//is mutex is unlocked, we unlock mutex's Qlock
+				mutex->lockQueue = 0; //opens the mutex waitQ
+			}
+		}
+
+        return 0;
+};
+
+/* release the mutex lock */
+int rpthread_mutex_unlock(rpthread_mutex_t *mutex) {
+	// Release mutex and make it available again. 
+	// Put threads in block list to run queue 
+	// so that they could compete for mutex later.
+
+	// YOUR CODE HERE
+
+
+	mutex->lockQueue = 1;//lock queue first, to stop new q's entering
+	//create node from waitQ's head
+
+	tNode *waitHead = dequeue(mutex->wait);
+
+	mutex->lockQueue = 0; //unlock the waitQ, to make changes
+
+	if(waitHead != NULL){//there exists thread in waitQ
+
+		enqueue(waitHead, readyQueue);
+		//append waitHead to readyQueue
+	}
+
+	return 0;
+};
+
+
+/* destroy the mutex */
+int rpthread_mutex_destroy(rpthread_mutex_t *mutex) {
+	// Deallocate dynamic memory created in rpthread_mutex_init
+
+	//we want to dump everything in mutex waitQ onto readyQ
+	tNode *waitHead = mutex->wait->head;
+
+	while(waitHead != NULL){
+
+		enqueue(waitHead, readyQueue);
+
+		waitHead = waitHead->nextNode;
+	}
+
+	free(mutex->wait);//free the entire waitQ
+
+	//to destroy, undo init_mutex
+	mutex->init = 0;
+	mutex->lock = 0;
+	mutex->lockQueue=0;
+	mutex->wait = NULL;
+
+	return 0;
+}
+
+// search funct, join needs enqueue, exit needs to free nodes
+int searchQ(rpthread_t tid, tQueue *queue){
+
+	tNode *curr = queue->head;
+	tNode *prev = curr;
+
+	int flag = 0; //1=join, 2=exit
+
+	if(queue == joinQueue) flag = 1;
+	if(queue == exitQueue) flag = 2;
+
+	if(flag==0){//not joinQ or exitQ
+		printf("ERROR\n");
+		return -999;
+	}
+
+	if(curr == NULL) return -1; //return empty
+
+	while(curr!= NULL){
+
+		if(curr->curtcb.tid == tid){//node exists in joinQueue
+			//enqueue the found node to readyqueue
+			//then remove it from joinQueue
+			if(curr == queue->head && curr->nextNode==NULL){ //still at the head and no more next
+				
+				curr->nextNode = NULL;
+
+				if(flag==1){
+					enqueue(curr, readyQueue);
+				}
+
+				queue->head = NULL;
+				queue->tail = NULL;
+			
+				if(flag==2) free(curr);
+			}
+			else if(curr == joinQueue->head && curr->nextNode!=NULL){//at head, but next exists
+
+				curr->nextNode = NULL;
+
+				if(flag==1)	enqueue(curr, readyQueue);
+
+				joinQueue->head = joinQueue->head->nextNode;
+
+				if(flag==2) free(curr);
+			}
+			else if(curr->nextNode == NULL){//our target is the last node in joinqueue
+
+				if(flag==1)enqueue(curr, readyQueue);
+
+				joinQueue->tail = prev;
+
+				if(flag==2) free(curr);
+
+			}
+
+			else{//in between two nodes
+
+				prev->nextNode = curr->nextNode;//skip curr
+				
+				curr->nextNode = NULL;
+
+				if(flag==1)enqueue(curr, readyQueue);
+				if(flag==2) free(curr);
+			}
+			
+			return 0; //node with the tid is found
+			
+		}
+		prev = curr;
+		curr = curr->nextNode;
+	}
+	//tid not found in joinQueue
+	return -1;
+}
+
+//return 1 when tid is found in exit queue, 0 otherwise 
+int searchExitQueue(rpthread_t tid){
+	tNode* cur = exitQueue->head; 
+	
+	while(cur != NULL){
+		if(cur->curtcb.tid == tid){
+			return 1; 
+		}
+		cur = cur->nextNode; 
+	}
+	return 0; 
+}
+
+void remove_joinlist(tidNode** head, tidNode* toRemove){
+	if((*head)->tid == toRemove->tid){
+		free(head);
+		*head = (*head)->next;  
+		return; 
+	}
+
+	tidNode *cur = (*head)->next, *prev = (*head); 
+	while(cur != NULL){
+		if(cur->tid == toRemove->tid){
+			toRemove->next = cur->next; 
+			free(cur); 
+			break; 
+		}
+		prev = cur; 
+		cur = cur->next; 		
+	}
+}
+
+//compares list of threads the node is waiting on to exitQueue, if found in exitQueue this means that thread is done so remove from node's joinList
+void compare_joinlist(tNode* node){
+	tidNode* head = node->jTids; 
+	if(head == NULL){
+		return; 
+	}
+
+	//not waiting on any threads
+	if(head == NULL){
+		return; 
+	}
+
+	//remove all tids found in exitQueue
+	tidNode* cur = head; 
+	while(cur != NULL){
+		if(searchExitQueue(cur->tid)){
+			//remove from jtids
+			remove_joinlist(&head, cur);
+			return; 
+		}
+		cur = cur->next; 
+	}
+}
+
+/* scheduler */
+static void schedule() {
+	// Every time when timer interrup happens, your thread library 
+	// should be contexted switched from thread context to this 
+	// schedule function
+
+	// Invoke different actual scheduling algorithms
+	// according to policy (RR or MLFQ)
+
+	// if (sched == RR)
+	//		sched_rr();
+	// else if (sched == MLFQ)
+	// 		sched_mlfq();
+
+	// YOUR CODE HERE
+
+	//if join,exit,mutex, we do not equeue, cause function already added equeue
+	//else, we equeue the tail of readyQ, cause the pthread was added to readyQ
+	//for our algorithm adds nodes to the tail, but because the three Q were not changed,
+	//the tail would be the 'first' node to be processed
+	
+	//setup for new thread input
+	if(joinCalled==1) joinCalled = 0;
+	
+	else if(exitCalled==1) exitCalled = 0;
+
+	else if(mutexCalled==1) mutexCalled=0;
+
+	else{
+		tNode *curr = dequeue(readyQueue);
+		enqueue(curr, readyQueue);
+	}
+
+	//if threads are waiting for others to finish 
+	if(joinQueue->head != NULL){
+		compare_joinlist(joinQueue->head);
+		if(joinQueue->head->jTids == NULL){
+			tNode* temp = dequeue(joinQueue); 
+			enqueue(temp, readyQueue);
+		}
+	}
+
+	tNode *firstNode = readyQueue->head;
+
+	if(firstNode == NULL){
+		//if null means no thread processed
+		printf("ERROR, no top thread node found in readyQ\n");
+		return;
+	}
+
+	//if equal then parent.tid is the firstNode in readyQ
+	if(firstNode->curtcb.tid == currentNode->curtcb.tid){
+
+		if(firstNode->nextNode != NULL){
+			firstNode = firstNode->nextNode;
+			//move firstNode to nextNode in readyQ
+			// this is later used to free
+		}
+	}
+
+	tNode *temp = currentNode;//currentNode is parent
+	currentNode = firstNode;//move current to first node
+
+	if(freeCalled==1){//exiting thread freed
+		//different form searchQ, we free node in exitQ
+		//here we are freeing temp
+		free(temp);
+		freeCalled = 0;
+		setcontext(firstNode->curtcb.ctx);
+	}
+	else{//swap temp's context with firstNode
+
+		if(swapcontext(temp->curtcb.ctx, firstNode->curtcb.ctx) == -1){
+			printf("AHHHH");
+		}
+	}
+
+	// schedule policy
+	//PART2
+	#ifndef MLFQ
+		// Choose RR
+		// CODE 1
+	#else 
+		// Choose MLFQ
+		// CODE 2
+	#endif
 
 }
 
-void enqueueJoin(threadNode * node){
-    //printf("enqueueJoin thread: %d\n", node->mythread->tid);
-    node->next = NULL;
-    if (joinQueue->front == NULL){
-        joinQueue->front = node;
-        joinQueue->end = node;
-    }
-    else {
-        joinQueue->end->next = node;
-        joinQueue->end = node;
-    }
-}
+//Append tNode to the end of tQueue
+void enqueue(tNode* newNode, tQueue *queue){
 
-//calling thread is looking for a thread that called join on it
-int searchJoin(int tid){
-    //printf("searchJoin entered\n");
-    threadNode * node = joinQueue->front;
-    threadNode * prev = node;
-
-    if (node == NULL){
-        //printf("joinQueue is empty\n");
-        return -1;
-    }
-
-    while (node != NULL){
-        if (node->mythread->joinOn == tid){
-            //printf("join complete\n");
-            //if first and only node in list
-            if (node->next == NULL && node == joinQueue->front){
-                joinQueue->front = NULL;
-                joinQueue->end = NULL;   
-            }   //first node but there are nodes after
-            else if (joinQueue->front == node){
-                joinQueue->front = joinQueue->front->next;
-            }
-            else if (node->next == NULL){
-                joinQueue->end = prev;
-            }
-            else{   //is in between nodes
-                prev->next = node->next;
-
-            }
-            //prepare and enqueue node to readyQueue
-            node->next = NULL;
-            int level = node->level;
-            if (level == NUM_LEVELS - 1){
-                 enqueueReady(level, node); 
-            }
-            else{
-                 enqueueReady(level + 1, node); 
-            }
-            return 0;
-
-        }
-        prev = node;
-        node = node->next;
-    }
-    //printf("corresponding thread not found\n");
-    return -1; 
-}
-
-void enqueueExit(threadNode * node){
-    //printf("enqueueExit thread: %d\n", node->mythread->tid);
-    node->next = NULL;
-    if (exitQueue->front == NULL){
-        exitQueue->front = node;
-        exitQueue->end = node;
-    }
-    else {
-        exitQueue->end->next = node;
-        exitQueue->end = node;
-    }
-}
-
-//calling thread is looking for a thread that it called join on
-int searchExit(int tid){
-    //printf("searchExit entered, looking for thread: %d\n", tid);
-
-    threadNode * node = exitQueue->front;
-    threadNode * prev = node;
-
-    if (node == NULL){
-        //printf("exitQueue is empty\n");
-        return -1;
-    }
-
-    while (node != NULL){
-        if (node->mythread->tid == tid){
-            //printf("join complete\n");
-            //if first and only node in list
-            if (node->next == NULL && node == exitQueue->front){
-                exitQueue->front = NULL;
-                exitQueue->end = NULL;   
-            }   //first node but there are nodes after
-            else if (exitQueue->front == node){
-                exitQueue->front = exitQueue->front->next;
-            }
-            else if (node->next == NULL){
-                exitQueue->end = prev;
-            }
-            else{   //is in between nodes
-                prev->next = node->next;
-
-            }
-            free(node);
-            return 0;
-
-        }
-        prev = node;
-        node = node->next;
-    }
-    //printf("corresponding thread not found\n");
-    return -1; 
+	newNode->nextNode=NULL;
+	if(queue->head == NULL){//empty queue
+		queue->head = newNode;
+		queue->tail = newNode;
+	}
+	else{
+		queue->tail->nextNode = newNode;
+		queue->tail->curtcb.ctx->uc_link = queue->tail->nextNode->curtcb.ctx;
+		queue->tail = queue->tail->nextNode;
+		
+	}
 
 }
 
+//we remove the first tNode from targetqueue
+//for mutex's waitQ and the readyQ
+tNode* dequeue(tQueue *queue){
 
-void enqueueMutex(wait_queue *waitQueue, threadNode * node){
-    //printf("enqueueMutex thread: %d\n", node->mythread->tid);
-    //get current thread
-    node->next = NULL;
-    if (waitQueue->front == NULL){
-        waitQueue->front = node;
-        waitQueue->end = node;
-    }
-    else {
-        waitQueue->end->next = node;
-        waitQueue->end = node;
-    }
-   
+	tNode *current = queue->head;
+	tNode *deqNode = NULL; //for extra cred
+
+	if(queue->head == NULL) deqNode = NULL;
+
+	else if(current->nextNode == NULL){
+
+		deqNode = queue->head;
+		queue->head = NULL;
+		queue->tail = NULL;
+
+	}
+	//this means there is more than one tNode in queue
+	else{
+		deqNode = queue->head;
+		queue->head = queue->head->nextNode;
+
+		deqNode->nextNode = NULL;
+	}
+	return deqNode;//we can just treat this as a void
 }
 
-threadNode *dequeueMutex(wait_queue *waitQueue){ // dequeue front of queue
-    threadNode * returnedNode = NULL;
-    if (waitQueue->front == NULL){
-        //printf("dequeue A\n");
-        returnedNode = NULL;
-    }
-    else if (waitQueue->front->next == NULL){
-        returnedNode = waitQueue->front;
-        waitQueue->front = NULL;
-        waitQueue->end = NULL;
-        //printf("dequeue B\n");
-    }
-    else {
-        returnedNode = waitQueue->front;
-        waitQueue->front = waitQueue->front->next;
-        returnedNode->next = NULL;
-        //printf("dequeue C\n");
-    }
-    return returnedNode;
+//for init queue
+void starter(tQueue *queue){
+
+	queue = malloc(sizeof(tQueue));
+	queue->head = NULL;
+	queue->tail = NULL;
 }
 
-void spin_lock(volatile int lock){
-    while (1){
-        while (lock == LOCKED);
-        if (__sync_lock_test_and_set(&lock, 1) == UNLOCKED){
-            break;
-        }
-    }
+//our initial runenqueue
+//initializes out queues
+void init_schedule(){
+
+	readyQueue = malloc(sizeof(tQueue)); 
+	readyQueue->head = NULL; 
+	readyQueue->tail = NULL; 
+	
+	exitQueue = malloc(sizeof(tQueue)); 
+	exitQueue->head = NULL; 
+	exitQueue->tail = NULL; 
+	
+	joinQueue = malloc(sizeof(tQueue));
+	exitQueue->head = NULL; 
+	exitQueue->tail = NULL; 
+
+	//signal for alarm
+	signal(SIGALRM, sighandler);
 }
 
-void spin_unlock(volatile int lock){
-    lock = UNLOCKED;
+void sighandler(int signum){//from 
+	printf("Caught signal %d, schedule starting...]\n", signum);
+	schedule();
 }
 
-void printReady(){
-    //printf("\nreadyQueue:\n");
-    int i;
-    for (i = 0; i < NUM_LEVELS; i++){
-        queue_level * subqueue = readyQueue->subqueues[i];
-        threadNode * node = subqueue->front;
-        //printf("level %d: ", i);
-        while (node != NULL){
-            printf("%d ", node->mythread->tid);
-            node = node->next;
-        }
-        printf("\n");
-    }
-    printf("\n");
+void resetTime(){
+
+	//setup time
+	tv.it_value.tv_sec= 0;
+	tv.it_value.tv_usec = 0;
+
+	tv.it_interval = tv.it_value;
+	//setup complete!
+}
+
+
+/* Round Robin (RR) scheduling algorithm */
+static void sched_rr() {
+	// Your own implementation of RR
+	// (feel free to modify arguments and return types)
+
+	// YOUR CODE HERE
+
+}
+
+/* Preemptive MLFQ scheduling algorithm */
+static void sched_mlfq() {
+	// Your own implementation of MLFQ
+	// (feel free to modify arguments and return types)
+
+	// YOUR CODE HERE
 }
